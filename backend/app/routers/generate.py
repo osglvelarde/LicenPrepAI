@@ -3,6 +3,7 @@ import re
 import random
 import requests
 import chromadb
+import time
 from fastapi import APIRouter
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
@@ -26,7 +27,8 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 class GenerateRequest(BaseModel):
-    query: str
+    category: str
+    query: str = ""
     k: int = 5
     num_questions: int = 3
 
@@ -46,7 +48,7 @@ async def generate_questions(request: GenerateRequest):
     query_embedding = model.encode([request.query]).tolist()[0]
 
     # Step 2: Over-query lots of documents
-    overquery_k = request.k * 5
+    overquery_k = request.k * 10  # Increased from 5 to 10 for more diversity
     results = collection.query(
         query_embeddings=[query_embedding],
         n_results=overquery_k,
@@ -77,25 +79,58 @@ async def generate_questions(request: GenerateRequest):
 
     questions = []
 
-    for context in selected_docs[:request.num_questions]:
+    timestamp = int(time.time())
+
+    for idx, context in enumerate(selected_docs[:request.num_questions]):
+        # Generate random patient parameters
+        age = random.randint(18, 90)
+        gender = random.choice(["Male", "Female"])
+        setting = random.choice(["clinic", "ER", "ICU", "hospital ward"])
+
         prompt = f"""
-You are a professional USMLE Step 1 and Step 2 CK question writer.
+You are an expert USMLE Step 1 question writer.
 
-Using ONLY the context below:
-- Write one high-quality multiple-choice question (MCQ) with 4 answer choices (A, B, C, D).
-- Randomize the patient age, gender, setting (clinic, ER, ICU).
-- Focus on clinical reasoning, not trivia.
-- Ensure each answer choice sounds plausible but only one is truly correct.
-- Format response exactly like:
+TASK:
+- Write **one multiple-choice clinical vignette** based on the provided CONTEXT.
+- Create a **high-quality USMLE-style question** following these rules:
 
-Stem: <clinical case and question here>
-A: <first option>
-B: <second option>
-C: <third option>
-D: <fourth option>
-Correct Answer: <letter A-D>
+1. **Patient Profile (MANDATORY)**
+   - Age: {age} years
+   - Gender: {gender}
+   - Setting: {setting}
+2. **Question Stem:**
+   - Focus on clinical reasoning (e.g., diagnosis, next best step, pathophysiology, pharmacology).
+   - Include realistic vital signs or physical exam findings if appropriate.
+   - Keep stem under 5 sentences.
+3. **Answer Choices:**
+   - Provide 4 plausible options (A-D).
+   - Ensure distractors are realistic DIFFERENTIAL diagnoses, common mistakes, or close but wrong management options.
+   - Only ONE definitively correct answer.
+4. **Explanation:**
+   - **Explain why the correct answer is right.**
+   - **Briefly explain why EACH wrong answer is wrong.**
+   - Use clear, concise USMLE-level language (avoid excessive fluff).
+5. **Difficulty:**
+   - Label question as easy / medium / hard based on clinical subtlety.
 
-Context:
+OUTPUT STRICTLY IN THIS FORMAT:
+---
+Stem: {{Write the full question stem here}}
+A: {{Option A}}
+B: {{Option B}}
+C: {{Option C}}
+D: {{Option D}}
+Correct Answer: {{A/B/C/D}}
+Explanation:
+- Correct: {{Explanation why the correct option is right.}}
+- Incorrect A: {{Explanation why A is wrong.}}
+- Incorrect B: {{Explanation why B is wrong.}}
+- Incorrect C: {{Explanation why C is wrong.}}
+- Incorrect D: {{Explanation why D is wrong.}}
+Difficulty: {{easy/medium/hard}}
+---
+
+CONTEXT:
 {context}
 """
 
@@ -116,24 +151,34 @@ Context:
                 continue
 
             raw_text = response_json["choices"][0]["message"]["content"]
+            
+            # Clean up any asterisks or other formatting marks
+            raw_text = raw_text.replace('**', '').strip()
 
-            # Parse
-            stem_match = re.search(r"Stem:\s*(.+?)(?:A:|\nA:)", raw_text, re.DOTALL)
+            # Parsing
+            stem_match = re.search(r"Stem:\s*(.+?)(?:\nA:|\n\nA:)", raw_text, re.DOTALL)
             a_match = re.search(r"A:\s*(.+?)\n", raw_text)
             b_match = re.search(r"B:\s*(.+?)\n", raw_text)
             c_match = re.search(r"C:\s*(.+?)\n", raw_text)
             d_match = re.search(r"D:\s*(.+?)\n", raw_text)
             correct_match = re.search(r"Correct Answer:\s*([A-D])", raw_text)
+            explanation_match = re.search(r"Explanation:\s*(.+?)(?:\n|$)", raw_text, re.DOTALL)
+            difficulty_match = re.search(r"Difficulty:\s*(easy|medium|hard)", raw_text, re.IGNORECASE)
 
             parsed = {
+                "id": f"generated-{timestamp}-{idx}",
                 "stem": stem_match.group(1).strip() if stem_match else "Stem not found",
-                "choices": {
-                    "A": a_match.group(1).strip() if a_match else "A not found",
-                    "B": b_match.group(1).strip() if b_match else "B not found",
-                    "C": c_match.group(1).strip() if c_match else "C not found",
-                    "D": d_match.group(1).strip() if d_match else "D not found",
-                },
-                "correct_answer": correct_match.group(1) if correct_match else "Answer not found"
+                "answers": [
+                    {"id": "a", "text": a_match.group(1).strip() if a_match else "A not found"},
+                    {"id": "b", "text": b_match.group(1).strip() if b_match else "B not found"},
+                    {"id": "c", "text": c_match.group(1).strip() if c_match else "C not found"},
+                    {"id": "d", "text": d_match.group(1).strip() if d_match else "D not found"},
+                ],
+                "correctAnswer": correct_match.group(1).lower() if correct_match else "a",
+                "explanation": explanation_match.group(1).strip() if explanation_match else "Explanation not found.",
+                "difficulty": difficulty_match.group(1).lower() if difficulty_match else "medium",
+                "category": request.category,
+                "lastPracticed": None,
             }
 
             questions.append(parsed)
